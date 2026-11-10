@@ -2,8 +2,11 @@ package com.chennan.moting.tts
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -44,6 +47,8 @@ object TtsController {
 
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
+    private var deviceCallback: AudioDeviceCallback? = null
+    private var bluetoothOutput = false
 
     private var text: String = ""
     private var paragraphs: List<IntRange> = emptyList()
@@ -82,6 +87,7 @@ object TtsController {
         if (engine != null || initFailed) return
         val appContext = context.applicationContext
         audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        registerDeviceCallback()
         state = State.PREPARING
         notifyState()
         engine = TextToSpeech(appContext) { status ->
@@ -455,5 +461,47 @@ object TtsController {
         val manager = audioManager ?: return
         focusRequest?.let { manager.abandonAudioFocusRequest(it) }
         focusRequest = null
+    }
+
+    // ---------------------------------------------------------------- 输出设备
+
+    /**
+     * 监听音频输出设备变化：蓝牙耳机断开后暂停朗读，避免声音突然切到扬声器。
+     * 仅在“断开前确实存在蓝牙输出”时触发，纯外放场景不会误暂停。
+     */
+    private fun registerDeviceCallback() {
+        val manager = audioManager ?: return
+        if (deviceCallback != null) return
+        refreshBluetoothOutput(manager)
+        val callback = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                refreshBluetoothOutput(manager)
+            }
+
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                val wasBluetooth = bluetoothOutput
+                refreshBluetoothOutput(manager)
+                if (wasBluetooth && !bluetoothOutput && state == State.PLAYING) {
+                    main.post { pause() }
+                }
+            }
+        }
+        manager.registerAudioDeviceCallback(callback, null)
+        deviceCallback = callback
+    }
+
+    private fun refreshBluetoothOutput(manager: AudioManager) {
+        bluetoothOutput = manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { device ->
+            when (device.type) {
+                AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+                AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+                -> true
+
+                AudioDeviceInfo.TYPE_BLE_HEADSET ->
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+
+                else -> false
+            }
+        }
     }
 }
