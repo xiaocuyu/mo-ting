@@ -54,6 +54,23 @@ class LibraryActivity : Activity() {
 
         if (savedInstanceState == null) handleExternalIntent(intent)
         handleDebugIntent(intent)
+        if (savedInstanceState == null) openLastBookOnLaunch(intent)
+    }
+
+    /**
+     * 冷启动直达上次阅读的书籍，省去每次从书架进入。
+     * 导入（VIEW/SEND）与 adb 调试入口优先，不抢占。
+     */
+    private fun openLastBookOnLaunch(intent: Intent?) {
+        val action = intent?.action
+        if (action == Intent.ACTION_VIEW || action == Intent.ACTION_SEND) return
+        if (intent?.hasExtra("open_book_id") == true) return
+        val record = LibraryRepository.mostRecent() ?: return
+        if (!LibraryRepository.fileFor(record).exists()) return
+        startActivity(
+            Intent(this, ReaderActivity::class.java)
+                .putExtra(ReaderActivity.EXTRA_BOOK_ID, record.id)
+        )
     }
 
     /** 仅用于 adb 自动化验证：通过 LibraryActivity 间接打开阅读器。 */
