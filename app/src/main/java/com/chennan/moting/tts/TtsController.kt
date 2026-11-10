@@ -13,12 +13,14 @@ import android.speech.tts.UtteranceProgressListener
 import com.chennan.moting.text.TextBlock
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
-import kotlin.math.min
 
 /**
  * 听书核心：把章节按段落切成朗读片段，交给系统 TTS，并把朗读进度（字级区间）回调给界面。
  */
 object TtsController {
+
+    /** 单次朗读窗口上限：合并相邻段落，减少云端 TTS 建流与音频轨重建次数。 */
+    private const val MAX_CHUNK_CHARS = 800
 
     enum class State { IDLE, PREPARING, PLAYING, PAUSED }
 
@@ -29,7 +31,8 @@ object TtsController {
         fun onTtsError(message: String?) {}
     }
 
-    private data class Chunk(val blockIndex: Int, val start: Int, val end: Int)
+    /** 朗读窗口：文本绝对区间 + 覆盖的段落下标。 */
+    private data class Window(val start: Int, val end: Int, val blockStart: Int, val blockEnd: Int)
 
     private val main = Handler(Looper.getMainLooper())
     private val listeners = CopyOnWriteArrayList<Listener>()
@@ -43,8 +46,9 @@ object TtsController {
     private var focusRequest: AudioFocusRequest? = null
 
     private var text: String = ""
-    private var chunks: List<Chunk> = emptyList()
-    private var currentChunk = 0
+    private var paragraphs: List<IntRange> = emptyList()
+    private var current: Window? = null
+    private var readingOffset = 0
     private var token = 0
     private var speed = 1.0f
     private var languageTag: String? = null
@@ -128,10 +132,9 @@ object TtsController {
         this.chapterIndex = chapterIndex
         this.languageTag = languageTag
         this.text = text
-        this.chunks = buildChunks(text, blocks)
+        this.paragraphs = buildParagraphs(text, blocks)
         token++
-        val startIndex = chunks.indexOfFirst { it.blockIndex >= startBlockIndex }
-        currentChunk = if (startIndex < 0) 0 else startIndex
+        current = windowAt(paragraphs.getOrNull(startBlockIndex)?.first ?: 0)
         applyLanguage()
         listeners.forEach { it.onTtsContentChanged() }
         notifyProgressAtCurrent()
@@ -162,7 +165,7 @@ object TtsController {
     fun stop() {
         engine?.stop()
         token++
-        currentChunk = 0
+        current = null
         state = State.IDLE
         abandonFocus()
         cancelSleepTimer()
@@ -170,18 +173,20 @@ object TtsController {
     }
 
     fun next() {
-        if (chunks.isEmpty()) return
-        if (currentChunk >= chunks.size - 1) {
+        if (paragraphs.isEmpty()) return
+        val from = paragraphStartAfter(readingOffset)
+        if (from == null) {
             completeChapter()
             return
         }
-        currentChunk++
+        current = windowAt(from)
         if (state == State.PLAYING) speakCurrent() else notifyProgressAtCurrent()
     }
 
     fun previous() {
-        if (chunks.isEmpty()) return
-        currentChunk = (currentChunk - 1).coerceAtLeast(0)
+        if (paragraphs.isEmpty()) return
+        val from = paragraphStartBefore(readingOffset) ?: paragraphs.first().first
+        current = windowAt(from)
         if (state == State.PLAYING) speakCurrent() else notifyProgressAtCurrent()
     }
 
@@ -215,27 +220,24 @@ object TtsController {
 
     // ---------------------------------------------------------------- 朗读
 
-    private fun speakCurrent() {
+    private fun speakCurrent(flush: Boolean = true) {
         if (!initialized) return
         val engine = engine ?: return
-        if (chunks.isEmpty()) {
-            completeChapter()
-            return
-        }
-        if (currentChunk !in chunks.indices) {
+        val window = current
+        if (window == null) {
             completeChapter()
             return
         }
         requestFocus()
-        val chunk = chunks[currentChunk]
-        val piece = text.substring(chunk.start, chunk.end)
+        val piece = text.substring(window.start, window.end)
+        readingOffset = window.start
         state = State.PLAYING
         notifyState()
         val result = engine.speak(
             piece,
-            TextToSpeech.QUEUE_FLUSH,
+            if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD,
             Bundle(),
-            "$token:$currentChunk",
+            "$token:${window.start}",
         )
         if (result == TextToSpeech.ERROR) {
             state = State.IDLE
@@ -260,22 +262,29 @@ object TtsController {
         override fun onStart(utteranceId: String?) {
             main.post {
                 val parsed = parseId(utteranceId) ?: return@post
-                if (parsed.first != token || parsed.second != currentChunk) return@post
+                val window = current ?: return@post
+                if (parsed.first != token || parsed.second != window.start) return@post
                 if (state != State.PLAYING) {
                     state = State.PLAYING
                     notifyState()
                 }
-                val chunk = chunks.getOrNull(currentChunk) ?: return@post
-                listeners.forEach { it.onTtsProgress(chunk.blockIndex, chunk.start, chunk.end) }
+                val firstEnd = paragraphs.getOrNull(window.blockStart)?.last?.plus(1) ?: window.end
+                listeners.forEach { it.onTtsProgress(window.blockStart, window.start, firstEnd) }
             }
         }
 
         override fun onDone(utteranceId: String?) {
             main.post {
                 val parsed = parseId(utteranceId) ?: return@post
-                if (parsed.first != token || parsed.second != currentChunk) return@post
-                currentChunk++
-                if (currentChunk < chunks.size) speakCurrent() else completeChapter()
+                val window = current ?: return@post
+                if (parsed.first != token || parsed.second != window.start) return@post
+                val next = windowAt(window.end)
+                if (next == null) {
+                    completeChapter()
+                } else {
+                    current = next
+                    speakCurrent(flush = false)
+                }
             }
         }
 
@@ -283,7 +292,7 @@ object TtsController {
         override fun onError(utteranceId: String?) {
             main.post {
                 val parsed = parseId(utteranceId) ?: return@post
-                if (parsed.first != token || parsed.second != currentChunk) return@post
+                if (parsed.first != token) return@post
                 state = State.IDLE
                 abandonFocus()
                 listeners.forEach { it.onTtsError("engine") }
@@ -294,11 +303,12 @@ object TtsController {
         override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
             main.post {
                 val parsed = parseId(utteranceId) ?: return@post
-                if (parsed.first != token || parsed.second != currentChunk) return@post
-                val chunk = chunks.getOrNull(currentChunk) ?: return@post
-                val absoluteStart = chunk.start + start
-                val absoluteEnd = chunk.start + end
-                listeners.forEach { it.onTtsProgress(chunk.blockIndex, absoluteStart, absoluteEnd) }
+                val window = current ?: return@post
+                if (parsed.first != token || parsed.second != window.start) return@post
+                val absoluteStart = window.start + start
+                val absoluteEnd = window.start + end
+                readingOffset = absoluteStart
+                listeners.forEach { it.onTtsProgress(blockIndexOf(absoluteStart), absoluteStart, absoluteEnd) }
             }
         }
     }
@@ -312,46 +322,70 @@ object TtsController {
         return t to c
     }
 
-    private fun buildChunks(text: String, blocks: List<TextBlock>): List<Chunk> {
-        val result = ArrayList<Chunk>()
-        for ((index, block) in blocks.withIndex()) {
+    /** 在 [start, end) 内按标点回溯，返回不超过上限的切分点。 */
+    private fun cutAt(text: String, start: Int, limit: Int, end: Int): Int {
+        if (limit >= end) return end
+        var i = limit
+        while (i > start + 120) {
+            val c = text[i - 1]
+            if (c == '。' || c == '！' || c == '？' || c == '；' || c == '…' ||
+                c == '.' || c == '!' || c == '?' || c == ';' || c == '\n'
+            ) {
+                return i
+            }
+            i--
+        }
+        return limit
+    }
+
+    private fun buildParagraphs(text: String, blocks: List<TextBlock>): List<IntRange> {
+        val result = ArrayList<IntRange>(blocks.size)
+        for (block in blocks) {
             var start = block.start.coerceIn(0, text.length)
             var end = block.end.coerceIn(start, text.length)
             while (start < end && text[start].isWhitespace()) start++
             while (end > start && text[end - 1].isWhitespace()) end--
-            if (end - start < 2) continue
-            if (end - start <= 480) {
-                result.add(Chunk(index, start, end))
-                continue
-            }
-            var cursor = start
-            while (cursor < end) {
-                val limit = min(cursor + 480, end)
-                var cut = limit
-                if (limit < end) {
-                    var i = limit
-                    while (i > cursor + 120) {
-                        val c = text[i - 1]
-                        if (c == '。' || c == '！' || c == '？' || c == '；' || c == '…' ||
-                            c == '.' || c == '!' || c == '?' || c == ';' || c == '\n'
-                        ) {
-                            cut = i
-                            break
-                        }
-                        i--
-                    }
-                }
-                if (cut <= cursor) cut = limit
-                result.add(Chunk(index, cursor, cut))
-                cursor = cut
-            }
+            if (end - start >= 2) result.add(start until end)
         }
         return result
     }
 
+    /** 从 offset 起合并相邻段落，取不超过上限的朗读窗口；越过正文末尾则返回 null。 */
+    private fun windowAt(offset: Int): Window? {
+        val index = paragraphs.indexOfFirst { offset < it.last + 1 }
+        if (index < 0) return null
+        val first = paragraphs[index]
+        val start = maxOf(first.first, offset)
+        if (start > first.last) return null
+        var end = first.last + 1
+        var lastIndex = index
+        while (lastIndex + 1 < paragraphs.size) {
+            val candidate = paragraphs[lastIndex + 1]
+            if (candidate.last + 1 - start > MAX_CHUNK_CHARS) break
+            end = candidate.last + 1
+            lastIndex++
+        }
+        if (end - start > MAX_CHUNK_CHARS) {
+            end = cutAt(text, start, start + MAX_CHUNK_CHARS, end)
+        }
+        if (end - start < 2) return null
+        return Window(start, end, index, lastIndex)
+    }
+
+    private fun paragraphStartAfter(offset: Int): Int? =
+        paragraphs.firstOrNull { it.first > offset }?.first
+
+    private fun paragraphStartBefore(offset: Int): Int? =
+        paragraphs.lastOrNull { it.first < offset }?.first
+
+    private fun blockIndexOf(offset: Int): Int {
+        val index = paragraphs.indexOfFirst { offset >= it.first && offset <= it.last }
+        return if (index >= 0) index else paragraphs.indexOfFirst { it.first > offset }.coerceAtLeast(0)
+    }
+
     private fun notifyProgressAtCurrent() {
-        val chunk = chunks.getOrNull(currentChunk) ?: return
-        listeners.forEach { it.onTtsProgress(chunk.blockIndex, chunk.start, chunk.start) }
+        val window = current ?: return
+        listeners.forEach { it.onTtsProgress(window.blockStart, window.start, window.start) }
     }
 
     private fun notifyState() {
@@ -404,7 +438,7 @@ object TtsController {
 
     private fun requestFocus() {
         val manager = audioManager ?: return
-        abandonFocus()
+        if (focusRequest != null) return
         val attributes = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
