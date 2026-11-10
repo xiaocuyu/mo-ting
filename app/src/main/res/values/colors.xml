@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 书库（暖墨色） -->
+    <color name="ink_bg">#14110E</color>
+    <color name="ink_surface">#1E1A16</color>
+    <color name="ink_surface_high">#2A241E</color>
+    <color name="ink_line">#352D25</color>
+    <color name="text_primary">#F2E9DB</color>
+    <color name="text_secondary">#A2937F</color>
+    <color name="text_tertiary">#6F6355</color>
+    <color name="accent">#D08A5A</color>
+    <color name="accent_soft">#3A2A1E</color>
+    <color name="ink_on_accent">#1A120B</color>
+
+    <!-- 阅读器 -->
+    <color name="paper">#F6F0E4</color>
+    <color name="paper_sepia">#EFE1C4</color>
+    <color name="night">#111110</color>
+</resources>
