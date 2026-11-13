@@ -22,8 +22,11 @@ import java.util.concurrent.CopyOnWriteArrayList
  */
 object TtsController {
 
-    /** 单次朗读窗口上限：合并相邻段落，减少云端 TTS 建流与音频轨重建次数。 */
-    private const val MAX_CHUNK_CHARS = 800
+    /** 单个朗读单元上限：按段落朗读，超长段落按标点切分。 */
+    private const val MAX_CHUNK_CHARS = 480
+
+    /** 打断结束后延迟恢复，给蓝牙耳机回连留出时间。 */
+    private const val RESUME_DELAY_MS = 1200L
 
     enum class State { IDLE, PREPARING, PLAYING, PAUSED }
 
@@ -49,6 +52,8 @@ object TtsController {
     private var focusRequest: AudioFocusRequest? = null
     private var deviceCallback: AudioDeviceCallback? = null
     private var bluetoothOutput = false
+    private var resumeAfterFocusGain = false
+    private var pausedOnBluetooth = false
 
     private var text: String = ""
     private var paragraphs: List<IntRange> = emptyList()
@@ -141,6 +146,7 @@ object TtsController {
         this.paragraphs = buildParagraphs(text, blocks)
         token++
         current = windowAt(paragraphs.getOrNull(startBlockIndex)?.first ?: 0)
+        readingOffset = current?.start ?: 0
         applyLanguage()
         listeners.forEach { it.onTtsContentChanged() }
         notifyProgressAtCurrent()
@@ -153,15 +159,46 @@ object TtsController {
             if (initFailed) listeners.forEach { it.onTtsError("init") }
             return
         }
+        // 从上次读到的段落继续，避免整段重读
+        val resume = paragraphStartAtOrBefore(readingOffset)
+        if (resume != null) current = windowAt(resume) ?: current
         speakCurrent()
     }
 
     fun pause() {
+        resumeAfterFocusGain = false
+        pausedOnBluetooth = false
+        if (state != State.PLAYING) return
+        pauseInternal()
+        abandonFocus()
+    }
+
+    /**
+     * 焦点被系统临时占用（来电、导航播报）时暂停：
+     * 保留焦点请求，待 AUDIOFOCUS_GAIN 回来后再恢复朗读。
+     */
+    private fun pauseForFocusLoss(pausedOnBt: Boolean = bluetoothOutput) {
+        if (state != State.PLAYING) return
+        resumeAfterFocusGain = true
+        pausedOnBluetooth = pausedOnBt
+        pauseInternal()
+    }
+
+    private fun pauseInternal() {
         if (state != State.PLAYING) return
         engine?.stop()
         state = State.PAUSED
-        abandonFocus()
         notifyState()
+    }
+
+    /** 打断结束后的恢复：蓝牙场景先等耳机回连，避免声音突然外放。 */
+    private fun resumeAfterInterruption() {
+        if (state != State.PAUSED) return
+        val manager = audioManager
+        if (manager != null) refreshBluetoothOutput(manager)
+        if (pausedOnBluetooth && !bluetoothOutput) return
+        pausedOnBluetooth = false
+        play()
     }
 
     fun toggle(context: Context) {
@@ -172,6 +209,8 @@ object TtsController {
         engine?.stop()
         token++
         current = null
+        resumeAfterFocusGain = false
+        pausedOnBluetooth = false
         state = State.IDLE
         abandonFocus()
         cancelSleepTimer()
@@ -186,6 +225,7 @@ object TtsController {
             return
         }
         current = windowAt(from)
+        readingOffset = from
         if (state == State.PLAYING) speakCurrent() else notifyProgressAtCurrent()
     }
 
@@ -193,6 +233,7 @@ object TtsController {
         if (paragraphs.isEmpty()) return
         val from = paragraphStartBefore(readingOffset) ?: paragraphs.first().first
         current = windowAt(from)
+        readingOffset = from
         if (state == State.PLAYING) speakCurrent() else notifyProgressAtCurrent()
     }
 
@@ -226,7 +267,7 @@ object TtsController {
 
     // ---------------------------------------------------------------- 朗读
 
-    private fun speakCurrent(flush: Boolean = true) {
+    private fun speakCurrent() {
         if (!initialized) return
         val engine = engine ?: return
         val window = current
@@ -241,7 +282,7 @@ object TtsController {
         notifyState()
         val result = engine.speak(
             piece,
-            if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD,
+            TextToSpeech.QUEUE_FLUSH,
             Bundle(),
             "$token:${window.start}",
         )
@@ -253,6 +294,8 @@ object TtsController {
     }
 
     private fun completeChapter() {
+        resumeAfterFocusGain = false
+        pausedOnBluetooth = false
         state = State.PAUSED
         notifyState()
         val handler = chapterFinishedHandler
@@ -289,7 +332,7 @@ object TtsController {
                     completeChapter()
                 } else {
                     current = next
-                    speakCurrent(flush = false)
+                    speakCurrent()
                 }
             }
         }
@@ -356,26 +399,19 @@ object TtsController {
         return result
     }
 
-    /** 从 offset 起合并相邻段落，取不超过上限的朗读窗口；越过正文末尾则返回 null。 */
+    /** 取 offset 所在段落作为朗读窗口，超长段落按标点切分；越过正文末尾则返回 null。 */
     private fun windowAt(offset: Int): Window? {
         val index = paragraphs.indexOfFirst { offset < it.last + 1 }
         if (index < 0) return null
-        val first = paragraphs[index]
-        val start = maxOf(first.first, offset)
-        if (start > first.last) return null
-        var end = first.last + 1
-        var lastIndex = index
-        while (lastIndex + 1 < paragraphs.size) {
-            val candidate = paragraphs[lastIndex + 1]
-            if (candidate.last + 1 - start > MAX_CHUNK_CHARS) break
-            end = candidate.last + 1
-            lastIndex++
-        }
+        val paragraph = paragraphs[index]
+        val start = maxOf(paragraph.first, offset)
+        if (start > paragraph.last) return null
+        var end = paragraph.last + 1
         if (end - start > MAX_CHUNK_CHARS) {
             end = cutAt(text, start, start + MAX_CHUNK_CHARS, end)
         }
         if (end - start < 2) return null
-        return Window(start, end, index, lastIndex)
+        return Window(start, end, index, index)
     }
 
     private fun paragraphStartAfter(offset: Int): Int? =
@@ -383,6 +419,10 @@ object TtsController {
 
     private fun paragraphStartBefore(offset: Int): Int? =
         paragraphs.lastOrNull { it.first < offset }?.first
+
+    /** 进度所在段落的起点；offset 恰好落在段首时返回该段。 */
+    private fun paragraphStartAtOrBefore(offset: Int): Int? =
+        paragraphs.lastOrNull { it.first <= offset }?.first
 
     private fun blockIndexOf(offset: Int): Int {
         val index = paragraphs.indexOfFirst { offset >= it.first && offset <= it.last }
@@ -435,10 +475,20 @@ object TtsController {
 
     private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
         when (change) {
-            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_GAIN ->
+                if (resumeAfterFocusGain) {
+                    resumeAfterFocusGain = false
+                    main.postDelayed({ resumeAfterInterruption() }, RESUME_DELAY_MS)
+                }
+
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                resumeAfterFocusGain = false
+                main.post { pause() }
+            }
+
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK,
-            -> main.post { pause() }
+            -> main.post { pauseForFocusLoss() }
         }
     }
 
@@ -482,7 +532,10 @@ object TtsController {
                 val wasBluetooth = bluetoothOutput
                 refreshBluetoothOutput(manager)
                 if (wasBluetooth && !bluetoothOutput && state == State.PLAYING) {
-                    main.post { pause() }
+                    // 通话中耳机让位给通话链路时保留恢复标记，挂断后仍可续播
+                    val inCall = manager.mode == AudioManager.MODE_IN_CALL ||
+                        manager.mode == AudioManager.MODE_IN_COMMUNICATION
+                    main.post { if (inCall) pauseForFocusLoss(wasBluetooth) else pause() }
                 }
             }
         }
